@@ -1,0 +1,91 @@
+# data/channels_list.yaml
+channels:
+  - name: "George Ivensiya"
+    username: "georgeivensiya"
+    language: "ru"
+    type: "geopolitics"
+    priority: 9
+    source_weight: 0.85
+    private: false
+    invite_link: null
+    notes: "Часто публикует новости о войне, заявлении/планах по пошлинам/введению войск. Высокий приоритет для геополитических триггеров."
+
+  - name: "РБК"
+    username: "rbc_news"
+    language: "ru"
+    type: "news"
+    priority: 10
+    source_weight: 0.90
+    private: false
+    invite_link: null
+    notes: "Крупный новостной источник. Рекомендуется включить дополнительную фильтрацию пропагандистского контента (bias filter)."
+
+  - name: "Varlamov News"
+    username: "varlamov_news"
+    language: "ru"
+    type: "news"
+    priority: 7
+    source_weight: 0.60
+    private: false
+    invite_link: null
+    notes: "Большая аудитория, но не всегда фактчекинг — относиться к источникам умеренно, повышать требования к подтверждению фактов."
+
+  - name: "InvestBorn"
+    username: "investborn"
+    language: "en"
+    type: "stocks"
+    priority: 6
+    source_weight: 0.50
+    private: false
+    invite_link: null
+    notes: "Канал про американский фондовый рынок, небольшая аудитория. Полезен для локальных торговых идей."
+
+  - name: "Incrypted"
+    username: "incrypted"
+    language: "en"
+    type: "crypto"
+    priority: 7
+    source_weight: 0.75
+    private: false
+    invite_link: null
+    notes: "Крипто/блокчейн новости; иногда упоминаются биржевые события и OTC-деятельность — полезен для ранних сигналов, но применять крипто-шум фильтр."
+
+  - name: "Incrypted Headlines"
+    username: "Incrypted_Headlines"
+    language: "en"
+    type: "crypto"
+    priority: 6
+    source_weight: 0.70
+    private: false
+    invite_link: null
+    notes: "Короткие заголовки крипто-новостей. Хорош для быстрого мониторинга, но часто краткие и без деталей."
+
+  - name: "Дом акций 2.0 (private)"
+    username: null
+    language: "ru"
+    type: "stocks"
+    priority: 6
+    source_weight: 0.60
+    private: true
+    invite_link: "https://t.me/+qudLcExCs_YzYTBi"
+    notes: "Закрытая группа — фокус на российских акциях; возможно полезны локальные идеи. Для работы бота: требуется добавить бота в группу с правами чтения."
+
+  - name: "Rus.Delfi.lv"
+    username: "rusdelfi_lv"
+    language: "ru"
+    type: "news"
+    priority: 9
+    source_weight: 0.95
+    private: false
+    invite_link: null
+    notes: "Официальный новостной ресурс Латвии — высокий уровень доверия по региональным событиям."
+
+  - name: "Exclusive.kz"
+    username: "kzexclusive"
+    language: "ru"
+    type: "news"
+    priority: 6
+    source_weight: 0.65
+    private: false
+    invite_link: null
+    notes: "Новости Казахстана и аналитика; небольшая аудитория, но релевантны региональным темам."

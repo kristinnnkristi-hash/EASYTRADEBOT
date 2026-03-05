@@ -1,0 +1,615 @@
+# data/event_filters.yaml
+# Event filter rules for QuasiHedge Bot
+# -------------------------------------
+# Структура:
+# meta: общая информация
+# defaults: глобальные настройки, которые используются при обработке правил
+# source_weights: рекомендуемые веса доверия для типов источников (можно переопределить per-channel)
+# categories: список правил по категориям; каждое правило содержит:
+#   name, description, weight (numeric), notify (bool), action (keep/ discard/ tag),
+#   severity (1-10), patterns (список строк/regex), languages, examples
+# trash: отдельный блок с низкоприоритетными/игнорируемыми фразами
+# composite_rules: общие правила proximity, ticker proximity window и т.д.
+
+meta:
+  version: 1.0
+  author: quasihedge-bot
+  created: 2026-03-05
+  description: |
+    Полный набор правил/фраз для детектирования событий в новостях / Telegram /
+    RSS. Включает англо- и русскоязычные шаблоны, веса и действия.
+    Использовать этот файл как источник прав для rule-matcher в nlp_events.py.
+
+defaults:
+  event_half_life_days: 30           # время полураспада влияния события
+  dedup_cosine_threshold: 0.85       # порог для de-duplication (cosine similarity)
+  proximity_window_words: 10         # максимальное расстояние (слов) между тикером и триггером
+  min_confidence_to_notify: 0.7      # порог confidence для уведомления (0..1)
+  min_analogs_required: 30
+  ticker_detection_regex: "\\b[A-Z0-9]{1,6}\\b"   # базовый тикер regex (можно уточнить)
+  languages_supported: ["en", "ru"]
+
+# Рекомендуемые веса доверия для источников — использовать для агрегирования confidence
+source_weights:
+  official_press_release: 1.0
+  reuters: 1.0
+  bloomberg: 1.0
+  sec_edgar: 1.0
+  major_media: 0.95
+  financial_news_site: 0.9
+  trusted_telegram_channel: 0.8
+  large_telegram_channel: 0.6
+  small_telegram_channel: 0.3
+  reddit: 0.2
+  twitter_x: 0.4
+  unknown: 0.2
+
+# ------------------------------
+# Категории правил (priority order: top = highest)
+# ------------------------------
+categories:
+
+  - name: geopolitical_critical
+    description: "Критические геополитические триггеры — немедленное уведомление"
+    weight: 10
+    severity: 10
+    notify: true
+    action: keep
+    languages: ["en", "ru"]
+    patterns:
+      # military / escalation (EN)
+      - "\\bescalation\\b"
+      - "\\bmilitary buildup\\b"
+      - "\\btroop deployment\\b"
+      - "\\bmissile strike\\b"
+      - "\\bairstrike\\b"
+      - "\\bdrone strike\\b"
+      - "\\bnaval exercise\\b"
+      - "\\bwarship\\b"
+      - "\\bcarrier strike group\\b"
+      - "\\bmilitary escalation\\b"
+      - "\\barmed conflict\\b"
+      - "\\bborder clashes\\b"
+      - "\\binvasion\\b"
+      - "\\bmobilization\\b"
+      - "\\bretaliation\\b"
+      - "\\bcounterattack\\b"
+      - "\\boffensive\\b"
+      - "\\bdefense pact\\b"
+      - "\\bArticle 5\\b"
+      - "\\bstate of emergency\\b"
+      - "\\bmartial law\\b"
+      - "\\bnational emergency\\b"
+      - "\\bmilitary alert\\b"
+      - "\\bair defense activation\\b"
+      # military (RU)
+      - "\\bэскалац(?:ия|ии)\\b"
+      - "\\bнаращиван(?:ие|ий) военного потенциала\\b"
+      - "\\bпереброска войск\\b"
+      - "\\bракетный удар\\b"
+      - "\\bвоздушный удар\\b"
+      - "\\bудар дрона\\b"
+      - "\\bвоенные учения\\b"
+      - "\\bвоенный корабль\\b"
+      - "\\bавианосная группа\\b"
+      - "\\bвоенная эскалация\\b"
+      - "\\bвоенный конфликт\\b"
+      - "\\bпограничные столкновения\\b"
+      - "\\bвторжение\\b"
+      - "\\bмобилизация\\b"
+      - "\\bответный удар\\b"
+      - "\\bконтрнаступление\\b"
+      - "\\bнаступление\\b"
+      - "\\bпакт о коллективной обороне\\b"
+      - "\\bвоенное положение\\b"
+      - "\\bчрезвычайное положение\\b"
+      - "\\bвоздушная оборона активированa\\b"
+
+    examples:
+      - "U.S. reports missile strike near border, evacuation in region"
+      - "Сообщается о переброске войск и эскалации — срочно."
+
+  - name: maritime_chokepoints
+    description: "Торговые/морские узлы и блокировки — важны для energy/logistics"
+    weight: 9
+    severity: 9
+    notify: true
+    action: keep
+    languages: ["en", "ru"]
+    patterns:
+      # EN
+      - "\\bstrait of hormuz\\b"
+      - "\\bsuez canal\\b"
+      - "\\bbab el mandeb\\b"
+      - "\\bmalacca strait\\b"
+      - "\\bshipping disruption\\b"
+      - "\\bmaritime security\\b"
+      - "\\bvessel seizure\\b"
+      - "\\btanker attack\\b"
+      - "\\boil tanker\\b"
+      - "\\bnaval blockade\\b"
+      - "\\bshipping insurance spike\\b"
+      - "\\bfreight disruption\\b"
+      - "\\bcontainer delay\\b"
+      - "\\bport closure\\b"
+      # RU
+      - "\\bОрмуз(?:ский|ск(?:ого)?) пролив\\b"
+      - "\\bСуэц(?:кий|кого) канал\\b"
+      - "\\bБаб-эль-Мандеб\\b"
+      - "\\bМалакас(?:кий|кого) пролив\\b"
+      - "\\bнарушение судоходства\\b"
+      - "\\bзахват судна\\b"
+      - "\\bатака на танкер\\b"
+      - "\\bблокада порта\\b"
+      - "\\bрост страховки судоходства\\b"
+
+    examples:
+      - "Strait of Hormuz sees tanker attack — shipping rates spike"
+      - "Атака на танкер в Ормузском проливе — перебои с поставками нефти"
+
+  - name: sanctions_trade_war
+    description: "Санкции, торговые ограничения, Section 122 и пр. — сильные макро-триггеры"
+    weight: 10
+    severity: 10
+    notify: true
+    action: keep
+    languages: ["en", "ru"]
+    patterns:
+      # sanctions / trade (EN)
+      - "\\bsanctions\\b"
+      - "\\bnew sanctions\\b"
+      - "\\bsecondary sanctions\\b"
+      - "\\bsanctions package\\b"
+      - "\\bsanctions expansion\\b"
+      - "\\basset freeze\\b"
+      - "\\bblacklist\\b"
+      - "\\bSDN list\\b"
+      - "\\bsanctions relief\\b"
+      - "\\bsanctions waiver\\b"
+      - "\\btariff(s)?\\b"
+      - "\\bnew tariff(s)?\\b"
+      - "\\btrade tariff(s)?\\b"
+      - "\\bimport duties\\b"
+      - "\\bexport ban\\b"
+      - "\\bexport restriction(s)?\\b"
+      - "\\btechnology export restriction(s)?\\b"
+      - "\\btrade dispute\\b"
+      - "\\btrade retaliation\\b"
+      - "\\bquota limits\\b"
+      - "\\bSection 122\\b"
+      # RU
+      - "\\bсанкц(?:ии|ия)\\b"
+      - "\\bновые санкции\\b"
+      - "\\bвторичные санкции\\b"
+      - "\\bпакет санкций\\b"
+      - "\\bзаморозка активов\\b"
+      - "\\bчерный список\\b"
+      - "\\bсписок SDN\\b"
+      - "\\bпошлин(?:а|ы)\\b"
+      - "\\bввозная пошлина\\b"
+      - "\\bзапрет на экспорт\\b"
+      - "\\bограничение экспорта\\b"
+      - "\\bторговая война\\b"
+      - "\\bквоты на импорт\\b"
+
+    examples:
+      - "Administration considering Section 122 tariffs on tech imports"
+      - "Рассматриваются новые санкции и запрет на экспорт чипов в страну X"
+
+  - name: macro_fed_inflation
+    description: "Макро — ФРС/инфляция/безработица — важные фоновые сигналы"
+    weight: 7
+    severity: 8
+    notify: false
+    action: tag
+    languages: ["en", "ru"]
+    patterns:
+      # Fed / rates
+      - "\\bfed rate\\b"
+      - "\\binterest rate decision\\b"
+      - "\\brate hike\\b"
+      - "\\brate cut\\b"
+      - "\\bfomc decision\\b"
+      - "\\bhawkish\\b"
+      - "\\bdovish\\b"
+      - "\\bquantitative tightening\\b"
+      - "\\bquantitative easing\\b"
+      - "\\bbalance sheet reduction\\b"
+      # Inflation (EN)
+      - "\\binflation surge\\b"
+      - "\\binflation slowdown\\b"
+      - "\\bCPI data\\b"
+      - "\\bPPI data\\b"
+      - "\\binflation expectations\\b"
+      - "\\bprice pressure\\b"
+      - "\\binflation spike\\b"
+      # RU
+      - "\\bФРС\\b"
+      - "\\bставка ФРС\\b"
+      - "\\bповышение ставки\\b"
+      - "\\bпонижение ставки\\b"
+      - "\\bинфляц(?:ия|ионный)\\b"
+      - "\\bданные CPI\\b"
+      - "\\bуровень безработицы\\b"
+      - "\\bзаявки на пособие по безработице\\b"
+
+    examples:
+      - "FOMC decision likely to be hawkish — market volatility expected"
+      - "Данные CPI оказались выше ожиданий — инфляция разгоняется"
+
+  - name: corporate_positive
+    description: "Корпоративные положительные драйверы: M&A, buybacks, partnerships, dividends"
+    weight: 8
+    severity: 8
+    notify: true
+    action: keep
+    languages: ["en", "ru"]
+    patterns:
+      # M&A (EN)
+      - "\\bannounces agreement to acquire\\b"
+      - "\\bagreed to be acquired\\b"
+      - "\\bmerger\\b"
+      - "\\bacquisition\\b"
+      - "\\bbuyout\\b"
+      - "\\btakeover\\b"
+      - "\\bstrategic acquisition\\b"
+      - "\\bfriendly takeover\\b"
+      - "\\bhostile takeover\\b"
+      - "\\ball stock deal\\b"
+      - "\\bcash deal\\b"
+      - "\\bmerger talks\\b"
+      - "\\bdeal discussions\\b"
+      # Partnerships (EN)
+      - "\\bstrategic partnership\\b"
+      - "\\bjoint venture\\b"
+      - "\\bcollaboration\\b"
+      - "\\bexclusive partnership\\b"
+      - "\\blong[- ]term agreement\\b"
+      - "\\btechnology partnership\\b"
+      - "\\bcloud partnership\\b"
+      - "\\bai partnership\\b"
+      # Buybacks & dividends
+      - "\\bshare buyback\\b"
+      - "\\bstock buyback\\b"
+      - "\\brepurchase program\\b"
+      - "\\bshare repurchase\\b"
+      - "\\bcapital return program\\b"
+      - "\\bdividend increase\\b"
+      - "\\bspecial dividend\\b"
+      - "\\bdividend boost\\b"
+      - "\\bdividend payout\\b"
+      - "\\bdividend hike\\b"
+      # RU equivalents
+      - "\\bслияние\\b"
+      - "\\bпоглощение\\b"
+      - "\\bпокупка компании\\b"
+      - "\\bвыкуп акций\\b"
+      - "\\bбайбэк\\b"
+      - "\\bповышение дивидендов\\b"
+      - "\\bпартнёрство\\b"
+      - "\\bсовместное предприятие\\b"
+
+    examples:
+      - "Company X announces agreement to acquire Company Y — synergies expected"
+      - "Компания объявила программу выкупа акций и повышение дивидендов"
+
+  - name: corporate_negative
+    description: "Негативные корпоративные события: earnings misses, investigations, governance issues"
+    weight: 9
+    severity: 9
+    notify: true
+    action: keep
+    languages: ["en", "ru"]
+    patterns:
+      # Earnings / guidance (EN)
+      - "\\bearnings miss(es)?\\b"
+      - "\\brevenue miss(es)?\\b"
+      - "\\bguidance cut\\b"
+      - "\\bprofit warning\\b"
+      - "\\bmargin pressure\\b"
+      - "\\brevenue decline\\b"
+      - "\\bweak outlook\\b"
+      - "\\blower forecast\\b"
+      # Investigations / legal (EN)
+      - "\\bSEC investigation\\b"
+      - "\\bregulatory investigation\\b"
+      - "\\bfraud probe\\b"
+      - "\\baccounting irregularit(?:y|ies)\\b"
+      - "\\bshareholder lawsuit\\b"
+      - "\\bclass action lawsuit\\b"
+      - "\\binternal investigation\\b"
+      - "\\bcorporate scandal\\b"
+      # Leadership (EN)
+      - "\\bCEO resignation\\b"
+      - "\\bCEO stepped down\\b"
+      - "\\bexecutive departure\\b"
+      - "\\bleadership change\\b"
+      - "\\bmanagement shakeup\\b"
+      - "\\bboard investigation\\b"
+      # RU equivalents
+      - "\\bотчетность задержана\\b"
+      - "\\bне достигли ожиданий\\b"
+      - "\\bпонижение прогноза\\b"
+      - "\\bрасследование SEC\\b"
+      - "\\bфинансовые нарушения\\b"
+      - "\\bисков(?:ое|ы) заявление\\b"
+      - "\\bотставка CEO\\b"
+      - "\\bкадровые перестановки\\b"
+
+    examples:
+      - "Company misses revenue expectations and cuts guidance"
+      - "SEC launches probe into accounting irregularities at Company Z"
+
+  - name: supply_chain
+    description: "Проблемы цепочки поставок и производства"
+    weight: 8
+    severity: 8
+    notify: true
+    action: keep
+    languages: ["en", "ru"]
+    patterns:
+      - "\\bsupply chain disruption\\b"
+      - "\\bcomponent shortage\\b"
+      - "\\bchip shortage\\b"
+      - "\\bfactory shutdown\\b"
+      - "\\bproduction halt\\b"
+      - "\\bmanufacturing delays\\b"
+      - "\\blogistics disruption\\b"
+      - "\\binventory shortage\\b"
+      - "\\bprocurement delay\\b"
+      # RU
+      - "\\bнарушение цепочки поставок\\b"
+      - "\\bдефицит компонентов\\b"
+      - "\\bдефицит чипов\\b"
+      - "\\bостанова производства\\b"
+      - "\\bконвейерная остановка\\b"
+      - "\\bзадержки производства\\b"
+
+    examples:
+      - "Chip shortage forces production halt at Plant A"
+      - "Задержки поставок компонентов привели к остановке сборки"
+
+  - name: ai_tech
+    description: "AI / Tech positive triggers"
+    weight: 7
+    severity: 7
+    notify: false
+    action: tag
+    languages: ["en", "ru"]
+    patterns:
+      - "\\bai breakthrough\\b"
+      - "\\bai model release\\b"
+      - "\\bnew ai chip\\b"
+      - "\\bgpu demand surge\\b"
+      - "\\bdata center expansion\\b"
+      - "\\bcloud contract\\b"
+      - "\\bsemiconductor expansion\\b"
+      - "\\bchip production increase\\b"
+      - "\\bnew architecture\\b"
+      - "\\bmodel announced\\b"
+      - "\\btransformer model\\b"
+      # RU
+      - "\\bпрорыв в ai\\b"
+      - "\\bновая модель ai\\b"
+      - "\\bновый чип\\b"
+      - "\\bрасширение дата-центра\\b"
+      - "\\bконтракт на облачные услуги\\b"
+
+    examples:
+      - "Company announces new AI chip architecture — potential revenue boost"
+
+  - name: energy
+    description: "Энергетические события: OPEC / production / embargo"
+    weight: 8
+    severity: 8
+    notify: true
+    action: keep
+    languages: ["en", "ru"]
+    patterns:
+      - "\\boil production cut\\b"
+      - "\\bOPEC decision\\b"
+      - "\\bproduction increase\\b"
+      - "\\boil supply disruption\\b"
+      - "\\bgas shortage\\b"
+      - "\\benergy crisis\\b"
+      - "\\bpipeline shutdown\\b"
+      - "\\boil embargo\\b"
+      # RU
+      - "\\bсокращение добычи нефти\\b"
+      - "\\bрешение ОПЕК\\b"
+      - "\\bперебой поставок нефти\\b"
+      - "\\bгазовый дефицит\\b"
+
+    examples:
+      - "OPEC announces production cut — oil prices surge"
+
+  - name: crypto_signals
+    description: "Ключевые крипто-драйверы"
+    weight: 6
+    severity: 6
+    notify: false
+    action: tag
+    languages: ["en", "ru"]
+    patterns:
+      - "\\betf approval\\b"
+      - "\\bspot bitcoin etf\\b"
+      - "\\bcrypto regulation\\b"
+      - "\\bstablecoin regulation\\b"
+      - "\\bexchange investigation\\b"
+      - "\\bcrypto ban\\b"
+      - "\\bcrypto adoption\\b"
+      - "\\binstitutional adoption\\b"
+      # RU
+      - "\\bодобрение ETF\\b"
+      - "\\bETF на биткоин\\b"
+      - "\\bрегулирование крипто\\b"
+      - "\\bзапрет криптовалюты\\b"
+
+    examples:
+      - "SEC approves spot bitcoin ETF — BTC surges"
+
+  - name: future_signals
+    description: "Планы / инсайды / черновики — future / expected wording"
+    weight: 4
+    severity: 5
+    notify: false
+    action: tag
+    languages: ["en", "ru"]
+    patterns:
+      - "\\bis expected to\\b"
+      - "\\bis planning to\\b"
+      - "\\bis planning on\\b"
+      - "\\bis considering\\b"
+      - "\\bis in talks to\\b"
+      - "\\bis preparing to\\b"
+      - "\\bsources say\\b"
+      - "\\baccording to sources\\b"
+      - "\\bleaked draft\\b"
+      - "\\bdraft bill\\b"
+      - "\\blegislation proposal\\b"
+      - "\\bregulators considering\\b"
+      # RU
+      - "\\bожидается\\b"
+      - "\\bпланируется\\b"
+      - "\\bрассматривается\\b"
+      - "\\bв переговорах\\b"
+      - "\\bпо данным источников\\b"
+      - "\\bв черновике\\b"
+      - "\\bзаконопроект\\b"
+      - "\\bисточник сообщает\\b"
+
+    examples:
+      - "Company is expected to announce partnership next quarter (sources)"
+      - "Компания планирует подготовить законопроект — источник сообщает"
+
+  - name: options_flow_and_blocktrades
+    description: "Опционный flow / block trades / dark pool prints — ранние институциональные сигналы"
+    weight: 7
+    severity: 8
+    notify: true
+    action: keep
+    languages: ["en", "ru"]
+    patterns:
+      - "\\bunusual options activity\\b"
+      - "\\bblock trade\\b"
+      - "\\bsweep\\b"
+      - "\\blarge call purchase\\b"
+      - "\\blarge put purchase\\b"
+      - "\\boptions flow\\b"
+      - "\\bIV spike\\b"
+      - "\\bopen interest spike\\b"
+      - "\\bdark pool print\\b"
+      - "\\binstitutional buying\\b"
+      # RU
+      - "\\bнеобычная активность в опционах\\b"
+      - "\\bблок-трейд\\b"
+      - "\\bсвип\\b"
+      - "\\bбольшая покупка колл\\b"
+      - "\\bрост открытого интереса\\b"
+      - "\\bпокупка институционалов\\b"
+
+    examples:
+      - "Unusual options activity detected — large call sweep at strikes near 200"
+
+# ------------------------------
+# Trash / ignore filters — discard immediately
+# ------------------------------
+trash:
+  action: discard
+  reason: "High-volume noise and marketing messages to ignore"
+  patterns:
+    - "\\bairdrop\\b"
+    - "\\bgiveaway\\b"
+    - "\\bwhitelist\\b"
+    - "\\bpresale\\b"
+    - "\\bmint\\b"
+    - "\\bmeme coin\\b"
+    - "\\bmemecoin\\b"
+    - "\\b100x\\b"
+    - "\\bsignals vip\\b"
+    - "\\bcrypto signals\\b"
+    - "\\btrading course\\b"
+    - "\\bsubscribe now\\b"
+    - "\\bpromotion\\b"
+    - "\\bsponsored post\\b"
+    - "\\bподпишись\\b"
+    - "\\bраздача токенов\\b"
+    - "\\bвайтлист\\b"
+    - "\\bпродажа по предзаказу\\b"
+    - "\\bобучение трейдингу\\b"
+    - "\\bзаработай\\b"
+    - "\\bскам\\b"
+    - "\\bрозыгрыш\\b"
+
+# ------------------------------
+# Composite / global matching configuration
+# ------------------------------
+composite_rules:
+  proximity_window_words: 10                     # сколько слов допускается между тикером и триггером
+  require_ticker_proximity_for_actions:
+    - geopolitical_critical
+    - sanctions_trade_war
+    - maritime_chokepoints
+    - corporate_negative
+    - options_flow_and_blocktrades
+  deduplication:
+    enabled: true
+    cosine_threshold: 0.85
+  time_decay:
+    enabled: true
+    half_life_days: 30
+  scoring:
+    # final score = weighted sum(source_weight * category_weight * pattern_count * recency_factor)
+    formula: "sum(source_weight * category_weight * evidence_count * recency_factor)"
+    normalize_to: 1.0
+  notify_threshold:
+    default: 0.7
+    critical_override: 0.5   # lower threshold for critical categories
+  min_sources_for_confident_event: 2
+
+# ------------------------------
+# Helper synonyms / aliases (удобно для расширения и быстрого поиска)
+# ------------------------------
+aliases:
+  # military synonyms
+  military:
+    - "army"
+    - "troops"
+    - "forces"
+    - "armed forces"
+  # trade synonyms
+  trade:
+    - "tariff"
+    - "duty"
+    - "tariffs"
+    - "customs duty"
+  # finance synonyms
+  buyback:
+    - "share buyback"
+    - "stock buyback"
+    - "repurchase program"
+  # crypto noise synonyms
+  crypto_noise:
+    - "airdrop"
+    - "giveaway"
+    - "presale"
+    - "mint"
+
+# ------------------------------
+# Channel-specific overrides (пример; actual channel mapping хранится отдельно в channels_list.yaml)
+# ------------------------------
+channel_overrides:
+  # пример: если канал высоко доверенный, можно увеличить source weight
+  "t.me/reuters": { source_weight: 1.0 }
+  "t.me/bloomberg": { source_weight: 1.0 }
+  "t.me/unknown_small": { source_weight: 0.25 }
+
+# ------------------------------
+# Notes (do not edit unless you know what you do)
+# ------------------------------
+notes:
+  - "При добавлении новых шаблонов используйте word-boundary (\\bpattern\\b) чтобы избежать ложных срабатываний."
+  - "Русские шаблоны должны учитывать базовые склонения (лучше использовать лемматизацию в NLP-пайплайне)."
+  - "proximity_window_words рекомендует использовать парсинг на уровне предложений; если тикер и триггер в одном предложении — считать как близкие."
+  - "trash patterns выполняются в начале пайплайна (fast reject) чтобы уменьшить нагрузку на NLP/embeddings."
+  - "future_signals помечаются tag='future' и получают меньший вес; в случае подтверждения (2+ источника) вес автоматически повышается."
