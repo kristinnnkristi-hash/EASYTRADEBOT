@@ -33,6 +33,7 @@ import asyncio
 import functools
 import html
 import logging
+import re
 import textwrap
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -92,6 +93,8 @@ class Orchestrator:
         self.watch_interval = int(getattr(self.cfg, "AUTO_WATCH_INTERVAL_SEC", 300))
         # rss interval
         self.rss_interval = int(getattr(self.cfg, "RSS_FETCH_INTERVAL_MINUTES", 30)) * 60
+        # optional background polling task reference (for telegram compatibility)
+        self._tg_poll_task: Optional[asyncio.Task] = None
 
     # -----------------------
     # Lifecycle
@@ -180,6 +183,13 @@ class Orchestrator:
                 logger.exception("Failed to cancel watch task %s", task)
         self._watch_tasks.clear()
 
+        # stop telegram polling if scheduled
+        if self._tg_poll_task:
+            try:
+                self._tg_poll_task.cancel()
+            except Exception:
+                logger.exception("Failed to cancel telegram poll task")
+
         # shutdown telegram app
         if self.telegram_app:
             try:
@@ -244,10 +254,30 @@ class Orchestrator:
         self.telegram_app.add_handler(CommandHandler("portfolio_review", self._cmd_portfolio_review))
         # Handler to accept free-text add_info
         self.telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._cmd_message))
-        # Start async polling
-        await self.telegram_app.start()
-        await self.telegram_app.updater.start_polling()
-        logger.info("Telegram bot started and polling.")
+
+        # Start async polling — try updater start first (older PTB), fallback to run_polling
+        try:
+            await self.telegram_app.start()
+            try:
+                # newer versions might expose updater with start_polling
+                if hasattr(self.telegram_app, "updater") and getattr(self.telegram_app, "updater") is not None:
+                    await self.telegram_app.updater.start_polling()
+                elif hasattr(self.telegram_app, "run_polling"):
+                    # run_polling is often blocking — run it in executor to avoid blocking event loop
+                    loop = asyncio.get_running_loop()
+                    self._tg_poll_task = loop.create_task(loop.run_in_executor(None, self.telegram_app.run_polling))
+                else:
+                    logger.info("Telegram application started but no polling method found; check PTB version.")
+            except Exception:
+                logger.exception("Failed to start telegram polling; attempting fallback run_polling()")
+                try:
+                    loop = asyncio.get_running_loop()
+                    self._tg_poll_task = loop.create_task(loop.run_in_executor(None, self.telegram_app.run_polling))
+                except Exception:
+                    logger.exception("Fallback run_polling failed.")
+            logger.info("Telegram bot started and polling.")
+        except Exception:
+            logger.exception("Failed to fully start Telegram application.")
 
     # -----------------------
     # Command implementations (Telegram / programmatic)
@@ -430,7 +460,7 @@ class Orchestrator:
         try:
             # fetch price
             price_df = await maybe_await(services.fetch_price_history(self.cfg, ticker))
-            if price_df is None or price_df.empty:
+            if price_df is None or (hasattr(price_df, "empty") and price_df.empty):
                 # try DB cache
                 price_df = db.get_price_history(self.cfg, ticker)
             # fetch benchmark
@@ -438,7 +468,7 @@ class Orchestrator:
             bench_df = None
             if bench_symbol:
                 bench_df = await maybe_await(services.fetch_price_history(self.cfg, bench_symbol))
-                if bench_df is None or bench_df.empty:
+                if bench_df is None or (hasattr(bench_df, "empty") and bench_df.empty):
                     bench_df = db.get_price_history(self.cfg, bench_symbol)
             # fundamentals
             fundamentals = await maybe_await(services.fetch_fundamentals(self.cfg, ticker))
@@ -493,7 +523,7 @@ class Orchestrator:
         """Run Monte-Carlo and report results."""
         try:
             price_df = await maybe_await(services.fetch_price_history(self.cfg, ticker))
-            if price_df is None or price_df.empty:
+            if price_df is None or (hasattr(price_df, "empty") and price_df.empty):
                 price_df = db.get_price_history(self.cfg, ticker)
             horizon_days = int(horizon_months * 30)
             n_sims = int(getattr(self.cfg, "MC_DEFAULT_N_SIMS", 2000))
@@ -557,7 +587,13 @@ class Orchestrator:
     async def _enable_watch(self, ticker: str, chat_id: Optional[int] = None) -> None:
         """Enable auto-watch: add to watchlist and start task."""
         try:
-            db.add_watchlist(self.cfg, name=f"auto_{ticker}", ticker=ticker)
+            # db API compatibility: call wrapper 'add_watchlist' or 'add_watchlist_entry'
+            if hasattr(db, "add_watchlist"):
+                db.add_watchlist(self.cfg, name=f"auto_{ticker}", ticker=ticker)
+            elif hasattr(db, "add_watchlist_entry"):
+                db.add_watchlist_entry(self.cfg, name=f"auto_{ticker}", symbol=ticker)
+            else:
+                logger.debug("No watchlist add API available in db module.")
         except Exception:
             logger.exception("Failed to add watchlist entry for %s", ticker)
         await self._start_watch_for_symbol(ticker)
@@ -572,14 +608,18 @@ class Orchestrator:
             except Exception:
                 logger.exception("Failed to cancel watch task for %s", ticker)
             self._watch_tasks.pop(ticker, None)
-        # remove watchlist rows
+        # remove watchlist rows (best-effort)
         try:
             session_list = db.list_watchlist(self.cfg)
             for w in session_list:
                 if w.symbol == ticker:
                     # naive deletion via SQLAlchemy in db module; here call a helper if exists
-                    # db.remove_watchlist(self.cfg, w.id) - not implemented; we will leave watchlist entry (light)
-                    pass
+                    if hasattr(db, "remove_watchlist"):
+                        try:
+                            db.remove_watchlist(self.cfg, w.id)
+                        except Exception:
+                            logger.exception("Failed to remove watchlist id=%s", w.id)
+                    # otherwise leave the row (light)
         except Exception:
             logger.exception("Failed to cleanup watchlist rows for %s", ticker)
 
@@ -704,12 +744,16 @@ class Orchestrator:
             for s in symbols:
                 # quick analysis (synchronous heavy operations offloaded to thread if needed)
                 price_df = await maybe_await(services.fetch_price_history(self.cfg, s))
-                if price_df is None or price_df.empty:
+                if price_df is None or (hasattr(price_df, "empty") and price_df.empty):
                     price_df = db.get_price_history(self.cfg, s)
                 fund = await maybe_await(services.fetch_fundamentals(self.cfg, s))
                 events = [e_to_dict(ev) for ev in db.list_events(self.cfg, ticker=s, limit=200)]
                 res = modeling.combine_scores(cfg=self.cfg, symbol=s, price_df=price_df, fundamentals=fund, events=events, benchmark_df=None, model=getattr(self, "_event_model", None))
-                resp_lines.append(f"{s}: score={res['final_score_10']:.1f}/10 conf={res['confidence']:.2f} pos={res['position']['size']:.2%}")
+                # defensive: ensure expected keys exist
+                score_10 = res.get("final_score_10", 0.0) if isinstance(res, dict) else 0.0
+                conf = res.get("confidence", 0.0) if isinstance(res, dict) else 0.0
+                pos_size = (res.get("position", {}).get("size", 0.0) if isinstance(res, dict) else 0.0)
+                resp_lines.append(f"{s}: score={score_10:.1f}/10 conf={conf:.2f} pos={pos_size:.2%}")
             await safe_send_message(self.telegram_app, chat_id, "Portfolio review:\n" + "\n".join(resp_lines))
         except Exception:
             logger.exception("Portfolio review failed")
@@ -741,7 +785,10 @@ def e_to_dict(ev: Any) -> Dict[str, Any]:
         }
     except Exception:
         # if ev is dict-like
-        return dict(ev)
+        try:
+            return dict(ev)
+        except Exception:
+            return {}
 
 
 def format_analysis_result(res: Dict[str, Any]) -> str:
@@ -770,11 +817,14 @@ def format_analysis_result(res: Dict[str, Any]) -> str:
             if p20 is not None:
                 lines.append(f"P(>20%): {p20:.1%}")
         # top factors
-        explain = res.get("explain", {})
-        comps = explain.get("components", {})
+        explain = res.get("explain", {}) or {}
+        comps = explain.get("components", {}) or {}
         lines.append("Top components:")
         for k, v in comps.items():
-            lines.append(f" - {k}: {v:.3f}")
+            try:
+                lines.append(f" - {k}: {v:.3f}")
+            except Exception:
+                lines.append(f" - {k}: {v}")
         return "\n".join(lines)
     except Exception:
         logger.exception("Failed to format analysis result")
@@ -807,9 +857,17 @@ async def safe_send_message(app: Any, chat_id: Optional[int], text: str) -> None
         logger.info("No chat_id provided for message: %s", text)
         return
     try:
+        escaped = html.escape(text)
         if app and getattr(app, "bot", None):
             # async send
-            await app.bot.send_message(chat_id=chat_id, text=html.escape(text))
+            try:
+                await app.bot.send_message(chat_id=chat_id, text=escaped)
+            except Exception:
+                # some Application instances expose send_message directly
+                try:
+                    await app.send_message(chat_id=chat_id, text=escaped)
+                except Exception:
+                    logger.exception("Failed to send message via telegram bot API")
         else:
             # fallback: log + if admin, maybe print
             logger.info("Message to %s: %s", chat_id, text)
@@ -832,10 +890,18 @@ def get_chat_id(update: "Update") -> Optional[int]:
 # -----------------------
 # Utility: maybe_await
 # -----------------------
-def maybe_await(x):
-    """If x is awaitable, await it; else return value."""
-    if asyncio.iscoroutine(x):
-        return x  # caller should await
+async def maybe_await(x):
+    """If x is awaitable (coroutine/future) -> await it; otherwise return value."""
+    # If x is a coroutine object or a future, await it
+    if asyncio.iscoroutine(x) or asyncio.isfuture(x):
+        return await x
+    # If x is an awaitable returned by some library object, attempt to await
+    try:
+        # many libs return objects with __await__
+        if hasattr(x, "__await__"):
+            return await x
+    except Exception:
+        pass
     return x
 
 
