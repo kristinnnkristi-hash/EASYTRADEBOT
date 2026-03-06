@@ -21,6 +21,11 @@ or DB initialization commands where possible.
 """
 
 from __future__ import annotations
+import sys
+from pathlib import Path
+
+# Добавляем корневую директорию проекта в PYTHONPATH
+sys.path.append(str(Path(__file__).parent.resolve()))
 import argparse
 import asyncio
 import logging

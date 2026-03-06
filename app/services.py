@@ -249,34 +249,17 @@ def initialize(cfg: Any) -> None:
         _SERVICES["telethon_client"] = None
 
     # aiohttp session (create in running event loop if available)
-    try:
-        if _HAS_AIOHTTP:
-            loop = None
-            try:
-                loop = asyncio.get_event_loop()
-            except Exception:
-                loop = None
-            if loop and loop.is_running():
-                # create session synchronously by scheduling a coroutine and waiting
-                async def _create():
-                    return aiohttp.ClientSession()
-                try:
-                    sess = loop.run_until_complete(_create())
-                    _SERVICES["aiohttp_session"] = sess
-                    logger.info("aiohttp session created")
-                except Exception:
-                    logger.exception("Failed to create aiohttp session")
-                    _SERVICES["aiohttp_session"] = None
-            else:
-                # no running loop — create session later lazily
-                _SERVICES["aiohttp_session"] = None
-        else:
-            _SERVICES["aiohttp_session"] = None
-    except Exception:
-        logger.exception("aiohttp init error")
+    # aiohttp session (создаём лениво, без run_until_complete)
+try:
+    if _HAS_AIOHTTP:
+        # всегда инициализируем как None, создаём сессию при первом запросе
         _SERVICES["aiohttp_session"] = None
-
-    logger.info("services.initialize done")
+        logger.info("aiohttp session will be created lazily on first use")
+    else:
+        _SERVICES["aiohttp_session"] = None
+except Exception:
+    logger.exception("aiohttp init error")
+    _SERVICES["aiohttp_session"] = None
 
 
 def shutdown(cfg: Any = None) -> None:
@@ -306,7 +289,7 @@ def shutdown(cfg: Any = None) -> None:
             try:
                 loop = asyncio.get_event_loop()
                 if loop and loop.is_running():
-                    loop.run_until_complete(client.disconnect())
+                    asyncio.create_task(client.disconnect())
                 else:
                     asyncio.run(client.disconnect())
             except Exception:

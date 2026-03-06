@@ -156,11 +156,11 @@ class Watchlist(Base):
 
 class ModelRegistry(Base):
     __tablename__ = "model_registry"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     version: Mapped[str] = mapped_column(String(64), nullable=False)
     path: Mapped[str] = mapped_column(String(512), nullable=False)
-    metadata: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    meta_info: Mapped[Optional[dict]] = mapped_column("metadata", JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
 

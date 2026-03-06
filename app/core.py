@@ -30,31 +30,37 @@ Notes:
 from __future__ import annotations
 
 import asyncio
-import functools
 import html
 import logging
 import re
-import textwrap
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Sequence
 
-# Submodules (may raise ImportError if missing; core handles it gracefully)
+# Submodules
 from app.config import Config
 import app.db as db
-import app.services as services  # expected wrappers for APIs and ingestion
+import app.services as services
 import app.nlp_events as nlp
 import app.modeling as modeling
-import app.mc_risk as mc_risk  # Monte Carlo & risk functionality
+import app.mc_risk as mc_risk
 
-# Telegram (async) support (python-telegram-bot v20+). Fallback if not installed.
+# Telegram (async) support
 try:
     from telegram import Update, __version__ as _ptb_ver  # type: ignore
-    from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters  # type: ignore
+    from telegram.ext import (
+        Application,
+        ApplicationBuilder,
+        CommandHandler,
+        MessageHandler,
+        ContextTypes,
+        filters,
+    )  # type: ignore
 
     _HAS_TELEGRAM = True
 except Exception:
     Application = None  # type: ignore
+    ApplicationBuilder = None  # type: ignore
     Update = None  # type: ignore
     ContextTypes = None  # type: ignore
     CommandHandler = None  # type: ignore
@@ -68,39 +74,26 @@ logger.addHandler(logging.NullHandler())
 
 @dataclass
 class Orchestrator:
-    """
-    Main orchestrator of the bot. Controls lifecycle and routes commands.
-
-    Usage:
-        orch = Orchestrator(cfg)
-        await orch.start()
-        await orch.run_forever(stop_event)
-        await orch.stop()
-    """
-
     cfg: Config
     telegram_app: Optional[Any] = None
-    _tasks: List[asyncio.Task] = None
-    _watch_tasks: Dict[str, asyncio.Task] = None
+    _tasks: Optional[List[asyncio.Task]] = None
+    _watch_tasks: Optional[Dict[str, asyncio.Task]] = None
     _running: bool = False
 
     def __post_init__(self) -> None:
-        self._tasks = []
-        self._watch_tasks = {}
-        # admin chat (for alerts) if configured
+        self._tasks = [] if self._tasks is None else self._tasks
+        self._watch_tasks = {} if self._watch_tasks is None else self._watch_tasks
         self.admin_chat_id = getattr(self.cfg, "ADMIN_CHAT_ID", None)
-        # default check interval for auto-watch (seconds)
         self.watch_interval = int(getattr(self.cfg, "AUTO_WATCH_INTERVAL_SEC", 300))
-        # rss interval
         self.rss_interval = int(getattr(self.cfg, "RSS_FETCH_INTERVAL_MINUTES", 30)) * 60
-        # optional background polling task reference (for telegram compatibility)
         self._tg_poll_task: Optional[asyncio.Task] = None
+        self._event_model = None
 
     # -----------------------
     # Lifecycle
     # -----------------------
     async def start(self) -> None:
-        """Initialize DB, NLP, services, modeling and start background tasks and Telegram (if enabled)."""
+        """Initialize DB, NLP, services, modeling and start background tasks."""
         logger.info("Orchestrator starting...")
         # init DB
         try:
@@ -118,7 +111,7 @@ class Orchestrator:
         except Exception:
             logger.exception("Services initialization failed (continuing).")
 
-        # initialize NLP pipeline and background worker
+        # initialize NLP pipeline
         try:
             nlp.initialize(self.cfg)
             logger.info("NLP pipeline initialized.")
@@ -127,7 +120,6 @@ class Orchestrator:
 
         # Prepare modeling artifacts if required
         try:
-            # no-block: load model if configured path present
             model_path = getattr(self.cfg, "EVENT_REACTION_MODEL_PATH", None)
             if model_path:
                 self._event_model = modeling.load_event_reaction_model(model_path)
@@ -139,16 +131,16 @@ class Orchestrator:
             self._event_model = None
 
         # start background tasks
-        # 1) periodic RSS ingest (if enabled)
         if getattr(self.cfg, "ENABLE_RSS_INGEST", False) or getattr(self.cfg, "ENABLE_TELEGRAM_INGEST", False):
             t = asyncio.create_task(self._periodic_ingest_loop(), name="periodic_ingest")
             self._tasks.append(t)
-        # 2) resume any watchlist tasks (if watchlist entries exist)
+
+        # resume watchlist tasks
         try:
             entries = db.list_watchlist(self.cfg)
             for e in entries:
-                sym = e.symbol
-                if getattr(self.cfg, "AUTO_WATCH_ON_START", False):
+                sym = getattr(e, "symbol", None)
+                if sym and getattr(self.cfg, "AUTO_WATCH_ON_START", False):
                     await self._start_watch_for_symbol(sym)
         except Exception:
             logger.exception("Failed to initialize watchlist tasks")
@@ -169,12 +161,14 @@ class Orchestrator:
         """Stop all background tasks, shutdown telegram and NLP pipelines."""
         logger.info("Orchestrator stopping...")
         self._running = False
+
         # cancel tasks
         for t in list(self._tasks):
             try:
                 t.cancel()
             except Exception:
                 logger.exception("Failed to cancel task %s", t)
+
         # cancel watch tasks
         for sym, task in list(self._watch_tasks.items()):
             try:
@@ -183,17 +177,24 @@ class Orchestrator:
                 logger.exception("Failed to cancel watch task %s", task)
         self._watch_tasks.clear()
 
-        # stop telegram polling if scheduled
+        # cancel telegram poll task if running
         if self._tg_poll_task:
             try:
                 self._tg_poll_task.cancel()
+                # give event loop a moment to process cancellation
+                await asyncio.sleep(0)
+                logger.info("Telegram polling task cancelled.")
             except Exception:
                 logger.exception("Failed to cancel telegram poll task")
 
         # shutdown telegram app
         if self.telegram_app:
             try:
-                await maybe_await(self.telegram_app.stop())
+                # Attempt graceful stop/shutdown using available APIs
+                if hasattr(self.telegram_app, "stop"):
+                    await maybe_await(self.telegram_app.stop())
+                if hasattr(self.telegram_app, "shutdown"):
+                    await maybe_await(self.telegram_app.shutdown())
                 logger.info("Telegram app stopped.")
             except Exception:
                 logger.exception("Failed stopping telegram app.")
@@ -230,7 +231,7 @@ class Orchestrator:
     # -----------------------
     async def _start_telegram(self) -> None:
         """Initialize telegram Application and handlers, then start polling."""
-        token = getattr(self.cfg, "TELEGRAM_BOT_TOKEN")
+        token = getattr(self.cfg, "TELEGRAM_BOT_TOKEN", None)
         if not token:
             logger.warning("Telegram token not configured; skipping telegram startup.")
             return
@@ -238,46 +239,55 @@ class Orchestrator:
             logger.warning("python-telegram-bot library not installed; skipping telegram.")
             return
 
-        # Build application
-        self.telegram_app = Application.builder().token(token).build()
+        # Build application via builder (PTB v20+)
+        try:
+            self.telegram_app = ApplicationBuilder().token(token).build()
+        except Exception:
+            # Fallback to Application if builder missing
+            try:
+                if Application is not None:
+                    self.telegram_app = Application()  # type: ignore
+                else:
+                    self.telegram_app = None
+            except Exception:
+                self.telegram_app = None
+
+        if not self.telegram_app:
+            logger.error("Failed to create Telegram Application instance.")
+            return
 
         # Register command handlers
-        self.telegram_app.add_handler(CommandHandler("start", self._cmd_start))
-        self.telegram_app.add_handler(CommandHandler("start_analysis", self._cmd_start_analysis))
-        self.telegram_app.add_handler(CommandHandler("add_info", self._cmd_add_info))
-        self.telegram_app.add_handler(CommandHandler("update_analysis", self._cmd_update_analysis))
-        self.telegram_app.add_handler(CommandHandler("step_summary", self._cmd_step_summary))
-        self.telegram_app.add_handler(CommandHandler("simulate", self._cmd_simulate))
-        self.telegram_app.add_handler(CommandHandler("compare_history", self._cmd_compare_history))
-        self.telegram_app.add_handler(CommandHandler("analyze_batch", self._cmd_analyze_batch))
-        self.telegram_app.add_handler(CommandHandler("auto_watch", self._cmd_auto_watch))
-        self.telegram_app.add_handler(CommandHandler("portfolio_review", self._cmd_portfolio_review))
-        # Handler to accept free-text add_info
-        self.telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._cmd_message))
-
-        # Start async polling — try updater start first (older PTB), fallback to run_polling
         try:
-            await self.telegram_app.start()
-            try:
-                # newer versions might expose updater with start_polling
-                if hasattr(self.telegram_app, "updater") and getattr(self.telegram_app, "updater") is not None:
-                    await self.telegram_app.updater.start_polling()
-                elif hasattr(self.telegram_app, "run_polling"):
-                    # run_polling is often blocking — run it in executor to avoid blocking event loop
-                    loop = asyncio.get_running_loop()
-                    self._tg_poll_task = loop.create_task(loop.run_in_executor(None, self.telegram_app.run_polling))
-                else:
-                    logger.info("Telegram application started but no polling method found; check PTB version.")
-            except Exception:
-                logger.exception("Failed to start telegram polling; attempting fallback run_polling()")
-                try:
-                    loop = asyncio.get_running_loop()
-                    self._tg_poll_task = loop.create_task(loop.run_in_executor(None, self.telegram_app.run_polling))
-                except Exception:
-                    logger.exception("Fallback run_polling failed.")
-            logger.info("Telegram bot started and polling.")
+            self.telegram_app.add_handler(CommandHandler("start", self._cmd_start))
+            self.telegram_app.add_handler(CommandHandler("start_analysis", self._cmd_start_analysis))
+            self.telegram_app.add_handler(CommandHandler("add_info", self._cmd_add_info))
+            self.telegram_app.add_handler(CommandHandler("update_analysis", self._cmd_update_analysis))
+            self.telegram_app.add_handler(CommandHandler("step_summary", self._cmd_step_summary))
+            self.telegram_app.add_handler(CommandHandler("simulate", self._cmd_simulate))
+            self.telegram_app.add_handler(CommandHandler("compare_history", self._cmd_compare_history))
+            self.telegram_app.add_handler(CommandHandler("analyze_batch", self._cmd_analyze_batch))
+            self.telegram_app.add_handler(CommandHandler("auto_watch", self._cmd_auto_watch))
+            self.telegram_app.add_handler(CommandHandler("portfolio_review", self._cmd_portfolio_review))
+            self.telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._cmd_message))
         except Exception:
-            logger.exception("Failed to fully start Telegram application.")
+            logger.exception("Failed to register Telegram handlers (continuing).")
+
+# Start application and polling safely
+try:
+    try:
+        await self.telegram_app.initialize()
+        await self.telegram_app.start()
+        await self.telegram_app.updater.start_polling()
+        logger.info("Telegram bot started and polling via async task.")
+    except TypeError:
+        loop = asyncio.get_running_loop()
+        self._tg_poll_task = loop.create_task(
+            loop.run_in_executor(None, self.telegram_app.run_polling)
+        )
+        logger.info("Telegram bot started and polling via executor.")
+
+except Exception:
+    logger.exception("Failed to fully start Telegram application.")
 
     # -----------------------
     # Command implementations (Telegram / programmatic)
@@ -303,20 +313,17 @@ class Orchestrator:
     async def _cmd_add_info(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         """
         Handler: /add_info TICKER <then send a batch of messages or pipe a link>
-        For simplicity: expects: /add_info TICKER then the next message(s) will be recorded via message handler.
-        Here we support inline usage: /add_info TICKER | text1; text2; text3
+        Inline usage supported: /add_info TICKER | text1; text2; text3
         """
         chat_id = get_chat_id(update)
         raw = " ".join(context.args) if hasattr(context, "args") else ""
         if "|" in raw:
-            # inline mode: /add_info TICKER | text1; text2
             try:
                 ticker, rest = raw.split("|", 1)
                 ticker = ticker.strip().upper()
                 parts = [p.strip() for p in re.split(r"[;\n\r]+", rest) if p.strip()]
-                texts = parts
                 saved_ids = []
-                for t in texts:
+                for t in parts:
                     eid = nlp.process_and_persist_event(self.cfg, t, source=f"telegram_{chat_id}", symbol_hint=ticker)
                     saved_ids.append(eid)
                 await safe_send_message(self.telegram_app, chat_id, f"Saved {len(saved_ids)} events for {ticker}.")
@@ -326,8 +333,6 @@ class Orchestrator:
                 await safe_send_message(self.telegram_app, chat_id, "Failed to parse /add_info inline format.")
                 return
         await safe_send_message(self.telegram_app, chat_id, "Send messages with news/plans now; they will be saved for the ticker.")
-        # The next messages would be captured by message handler which could store context - implementing context-state is beyond current compact core.
-        # As a fallback, instruct user to use the inline format.
 
     async def _cmd_update_analysis(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         """Handler: /update_analysis TICKER"""
@@ -349,8 +354,12 @@ class Orchestrator:
             return
         ticker = args[0].upper()
         await safe_send_message(self.telegram_app, chat_id, f"Preparing step summary for {ticker} ...")
-        res = await self._build_summary(ticker)
-        await safe_send_message(self.telegram_app, chat_id, res)
+        # _build_summary not implemented here — keep call but guard
+        if hasattr(self, "_build_summary"):
+            res = await maybe_await(self._build_summary(ticker))
+            await safe_send_message(self.telegram_app, chat_id, res)
+        else:
+            await safe_send_message(self.telegram_app, chat_id, "Step summary not available.")
 
     async def _cmd_simulate(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         """Handler: /simulate TICKER HORIZON_MONTHS"""
@@ -366,7 +375,6 @@ class Orchestrator:
             await safe_send_message(self.telegram_app, chat_id, "HORIZON_MONTHS must be integer (1,6,12).")
             return
         await safe_send_message(self.telegram_app, chat_id, f"Running Monte-Carlo for {ticker} {horizon}M ...")
-        # run simulation in background
         asyncio.create_task(self._simulate_and_report(ticker, horizon, chat_id))
 
     async def _cmd_compare_history(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
@@ -423,23 +431,19 @@ class Orchestrator:
         text = update.message.text.strip() if update and update.message and update.message.text else ""
         if text.lower().startswith("\\analysis "):
             payload = text[len("\\analysis ") :].strip()
-            # payload can be a URL or long blob with separators ; or newline
             parts = [p.strip() for p in re.split(r"[;\n\r]+", payload) if p.strip()]
             if not parts:
                 await safe_send_message(self.telegram_app, chat_id, "No data found in analysis payload.")
                 return
-            # if first part looks like ticker, use that as symbol_hint
             symbol_hint = None
             first = parts[0]
             if re.match(r"^[A-Z0-9]{1,6}$", first):
                 symbol_hint = first.upper()
                 parts = parts[1:]
-            # process as batch
             await safe_send_message(self.telegram_app, chat_id, f"Processing {len(parts)} supplied items for analysis...")
             ids = nlp.process_batch(self.cfg, [{"text": p, "symbol": symbol_hint} for p in parts], source=f"tg_{chat_id}")
             await safe_send_message(self.telegram_app, chat_id, f"Saved {len(ids)} events. You can now use /update_analysis {symbol_hint or '<ticker>'}.")
             return
-        # default reply
         await safe_send_message(self.telegram_app, chat_id, "Message received. For batch analysis use \\analysis <TICKER?> <items...> or /help.")
 
     # -----------------------
@@ -448,21 +452,14 @@ class Orchestrator:
     async def _analyze_and_report(self, ticker: str, chat_id: Optional[int] = None, force_refresh: bool = False) -> None:
         """
         Orchestrate data fetching, scoring, MC, risk and report generation.
-
-        Steps:
-          1. Fetch price history
-          2. Fetch fundamentals (best-effort)
-          3. Load recent events from DB for ticker
-          4. Call modeling.combine_scores
-          5. Save analysis to DB and notify user
         """
         logger.info("Analyze_and_report started for %s", ticker)
         try:
             # fetch price
             price_df = await maybe_await(services.fetch_price_history(self.cfg, ticker))
             if price_df is None or (hasattr(price_df, "empty") and price_df.empty):
-                # try DB cache
                 price_df = db.get_price_history(self.cfg, ticker)
+
             # fetch benchmark
             bench_symbol = getattr(self.cfg, "BASE_BENCHMARK", None)
             bench_df = None
@@ -470,12 +467,24 @@ class Orchestrator:
                 bench_df = await maybe_await(services.fetch_price_history(self.cfg, bench_symbol))
                 if bench_df is None or (hasattr(bench_df, "empty") and bench_df.empty):
                     bench_df = db.get_price_history(self.cfg, bench_symbol)
+
             # fundamentals
             fundamentals = await maybe_await(services.fetch_fundamentals(self.cfg, ticker))
+
             # events
             events = [e_to_dict(ev) for ev in db.list_events(self.cfg, ticker=ticker, limit=200)]
+
             # modeling
-            result = modeling.combine_scores(cfg=self.cfg, symbol=ticker, price_df=price_df, fundamentals=fundamentals, events=events, benchmark_df=bench_df, model=getattr(self, "_event_model", None))
+            result = modeling.combine_scores(
+                cfg=self.cfg,
+                symbol=ticker,
+                price_df=price_df,
+                fundamentals=fundamentals,
+                events=events,
+                benchmark_df=bench_df,
+                model=getattr(self, "_event_model", None),
+            )
+
             # save analysis to DB
             try:
                 ar = {
@@ -539,16 +548,13 @@ class Orchestrator:
     async def _compare_history_and_report(self, ticker: str, chat_id: Optional[int]) -> None:
         """Find analogs and report summary stats."""
         try:
-            # find recent events for ticker and pick latest to find analogs
             events = db.list_events(self.cfg, ticker=ticker, limit=50)
             if not events:
                 await safe_send_message(self.telegram_app, chat_id, f"No events saved for {ticker}.")
                 return
-            # use latest event
             latest = events[0]
             ref = {"event_type": latest.event_type, "embedding": latest.embedding, "timestamp": latest.timestamp, "source": latest.source}
             analogs, stats = db.find_analogs(self.cfg, ref, ticker)
-            # format output
             txt = f"Found {stats.get('n_analogs', 0)} analogs for latest event of {ticker}.\n"
             for h in ("30", "90", "180"):
                 mean_k = f"mean_excess_{h}"
@@ -563,16 +569,13 @@ class Orchestrator:
     async def _analyze_batch_and_report(self, tickers: Sequence[str], chat_id: Optional[int]) -> None:
         """Analyze a list of tickers and send a concise report (top picks)."""
         try:
-            results = {}
+            results: Dict[str, Dict[str, float]] = {}
             for t in tickers:
                 await self._analyze_and_report(t, None)
-                # load last analysis for t
                 last = db.get_recent_analyses(self.cfg, ticker=t, limit=1)
                 if last:
-                    # just retrieve score & confidence
                     a = last[0]
-                    results[t] = {"score": a.score, "confidence": a.confidence}
-            # format summary
+                    results[t] = {"score": getattr(a, "score", 0.0), "confidence": getattr(a, "confidence", 0.0)}
             lines = ["Batch analysis complete. Results:"]
             for t, r in results.items():
                 lines.append(f"{t}: score={r['score']:.3f} conf={r['confidence']:.2f}")
@@ -587,7 +590,6 @@ class Orchestrator:
     async def _enable_watch(self, ticker: str, chat_id: Optional[int] = None) -> None:
         """Enable auto-watch: add to watchlist and start task."""
         try:
-            # db API compatibility: call wrapper 'add_watchlist' or 'add_watchlist_entry'
             if hasattr(db, "add_watchlist"):
                 db.add_watchlist(self.cfg, name=f"auto_{ticker}", ticker=ticker)
             elif hasattr(db, "add_watchlist_entry"):
@@ -600,7 +602,6 @@ class Orchestrator:
 
     async def _disable_watch(self, ticker: str, chat_id: Optional[int] = None) -> None:
         """Disable auto-watch: cancel task and remove watchlist entries (all)."""
-        # cancel task
         task = self._watch_tasks.get(ticker)
         if task:
             try:
@@ -612,14 +613,12 @@ class Orchestrator:
         try:
             session_list = db.list_watchlist(self.cfg)
             for w in session_list:
-                if w.symbol == ticker:
-                    # naive deletion via SQLAlchemy in db module; here call a helper if exists
+                if getattr(w, "symbol", None) == ticker:
                     if hasattr(db, "remove_watchlist"):
                         try:
-                            db.remove_watchlist(self.cfg, w.id)
+                            db.remove_watchlist(self.cfg, getattr(w, "id", None))
                         except Exception:
-                            logger.exception("Failed to remove watchlist id=%s", w.id)
-                    # otherwise leave the row (light)
+                            logger.exception("Failed to remove watchlist id=%s", getattr(w, "id", None))
         except Exception:
             logger.exception("Failed to cleanup watchlist rows for %s", ticker)
 
@@ -644,7 +643,6 @@ class Orchestrator:
         try:
             while True:
                 try:
-                    # fetch new raw items related to ticker (services must provide a helper)
                     raw_items = []
                     if hasattr(services, "fetch_recent_messages_for_symbol"):
                         try:
@@ -652,7 +650,6 @@ class Orchestrator:
                         except Exception:
                             logger.exception("fetch_recent_messages_for_symbol failed")
                     else:
-                        # fallback: fetch all recent from channels and filter by symbol in text (inefficient)
                         if getattr(self.cfg, "ENABLE_RSS_INGEST", False) and hasattr(services, "fetch_rss"):
                             try:
                                 feeds = getattr(self.cfg, "MONITOR_RSS_FEEDS", [])
@@ -669,18 +666,14 @@ class Orchestrator:
                         if ticker.upper() in txt.upper():
                             new_items.append({"text": txt, "timestamp": it.get("timestamp") if isinstance(it, dict) else None, "extra": it})
                     if new_items:
-                        # persist
                         ids = nlp.process_batch(self.cfg, [{"text": it["text"], "timestamp": it.get("timestamp"), "symbol": ticker} for it in new_items], source=f"watch_{ticker}")
                         logger.info("Watch found %d new items for %s", len(ids), ticker)
-                        # quick analyze: if average sentiment/relevance strong -> run analysis and notify
                         events = [e_to_dict(db.get_event_by_id(self.cfg, eid)) for eid in ids if db.get_event_by_id(self.cfg, eid)]
                         avg_sent = sum((ev.get("sentiment", 0) for ev in events), 0.0) / max(1, len(events))
                         avg_rel = sum((ev.get("relevance", 0) for ev in events), 0.0) / max(1, len(events))
                         logger.debug("Watch stats %s avg_sent=%.3f avg_rel=%.3f", ticker, avg_sent, avg_rel)
                         if avg_rel > 0.5 and abs(avg_sent) > 0.2:
-                            # trigger analysis
                             await self._analyze_and_report(ticker, self.admin_chat_id)
-                    # update last_seen timestamp
                     last_seen = datetime.utcnow()
                 except asyncio.CancelledError:
                     logger.info("Watch loop cancelled for %s", ticker)
@@ -704,14 +697,11 @@ class Orchestrator:
                         try:
                             all_items = await maybe_await(services.fetch_all_rss(self.cfg))
                             logger.info("Fetched %d RSS items", len(all_items) if all_items else 0)
-                            # naive processing: persist items as events (symbol detection via nlp)
                             if all_items:
-                                # create dicts
                                 items = [{"text": it.get("title") or it.get("summary") or it.get("content") or "", "timestamp": it.get("published")} for it in all_items]
                                 nlp.process_batch(self.cfg, items, source="rss_periodic")
                         except Exception:
                             logger.exception("Periodic RSS fetch failed")
-                    # Telegram ingest if enabled
                     if getattr(self.cfg, "ENABLE_TELEGRAM_INGEST", False) and hasattr(services, "fetch_all_telegram"):
                         try:
                             tg_items = await maybe_await(services.fetch_all_telegram(self.cfg))
@@ -736,20 +726,19 @@ class Orchestrator:
         """Run scoring for watchlist entries and produce a consolidated report."""
         try:
             entries = db.list_watchlist(self.cfg)
-            symbols = [e.symbol for e in entries]
+            symbols = [getattr(e, "symbol", None) for e in entries]
+            symbols = [s for s in symbols if s]
             if not symbols:
                 await safe_send_message(self.telegram_app, chat_id, "Watchlist is empty.")
                 return
             resp_lines = []
             for s in symbols:
-                # quick analysis (synchronous heavy operations offloaded to thread if needed)
                 price_df = await maybe_await(services.fetch_price_history(self.cfg, s))
                 if price_df is None or (hasattr(price_df, "empty") and price_df.empty):
                     price_df = db.get_price_history(self.cfg, s)
                 fund = await maybe_await(services.fetch_fundamentals(self.cfg, s))
                 events = [e_to_dict(ev) for ev in db.list_events(self.cfg, ticker=s, limit=200)]
                 res = modeling.combine_scores(cfg=self.cfg, symbol=s, price_df=price_df, fundamentals=fund, events=events, benchmark_df=None, model=getattr(self, "_event_model", None))
-                # defensive: ensure expected keys exist
                 score_10 = res.get("final_score_10", 0.0) if isinstance(res, dict) else 0.0
                 conf = res.get("confidence", 0.0) if isinstance(res, dict) else 0.0
                 pos_size = (res.get("position", {}).get("size", 0.0) if isinstance(res, dict) else 0.0)
@@ -770,7 +759,6 @@ def e_to_dict(ev: Any) -> Dict[str, Any]:
     if ev is None:
         return {}
     try:
-        # ORM object
         return {
             "uid": getattr(ev, "uid", None),
             "symbol": getattr(ev, "symbol", None),
@@ -784,7 +772,6 @@ def e_to_dict(ev: Any) -> Dict[str, Any]:
             "source": getattr(ev, "source", None),
         }
     except Exception:
-        # if ev is dict-like
         try:
             return dict(ev)
         except Exception:
@@ -808,7 +795,6 @@ def format_analysis_result(res: Dict[str, Any]) -> str:
         if expected is not None:
             lines.append(f"Model expected excess return: {expected:.2%}")
         if "mc_report" in res and res["mc_report"]:
-            # compact MC summary
             mc = res["mc_report"]
             median = mc.get("median", None)
             p20 = mc.get("p_ge_20pct", None) or mc.get("p_gt_20pct", None)
@@ -816,7 +802,6 @@ def format_analysis_result(res: Dict[str, Any]) -> str:
                 lines.append(f"MC median: {median:.2%}")
             if p20 is not None:
                 lines.append(f"P(>20%): {p20:.1%}")
-        # top factors
         explain = res.get("explain", {}) or {}
         comps = explain.get("components", {}) or {}
         lines.append("Top components:")
@@ -859,17 +844,14 @@ async def safe_send_message(app: Any, chat_id: Optional[int], text: str) -> None
     try:
         escaped = html.escape(text)
         if app and getattr(app, "bot", None):
-            # async send
             try:
                 await app.bot.send_message(chat_id=chat_id, text=escaped)
             except Exception:
-                # some Application instances expose send_message directly
                 try:
                     await app.send_message(chat_id=chat_id, text=escaped)
                 except Exception:
                     logger.exception("Failed to send message via telegram bot API")
         else:
-            # fallback: log + if admin, maybe print
             logger.info("Message to %s: %s", chat_id, text)
     except Exception:
         logger.exception("Failed to send message to %s: %s", chat_id, text)
@@ -892,21 +874,14 @@ def get_chat_id(update: "Update") -> Optional[int]:
 # -----------------------
 async def maybe_await(x):
     """If x is awaitable (coroutine/future) -> await it; otherwise return value."""
-    # If x is a coroutine object or a future, await it
     if asyncio.iscoroutine(x) or asyncio.isfuture(x):
         return await x
-    # If x is an awaitable returned by some library object, attempt to await
     try:
-        # many libs return objects with __await__
         if hasattr(x, "__await__"):
             return await x
     except Exception:
         pass
     return x
-
-
-# Note: because many service functions may be sync or async, callers in this core
-# frequently use 'await maybe_await( service(...) )' pattern (see above usage).
 
 
 # -----------------------
